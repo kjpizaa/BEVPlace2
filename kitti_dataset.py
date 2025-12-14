@@ -44,104 +44,140 @@ class InferDataset(data.Dataset):
         return len(self.imgs_path)
 
 
-def evaluateResults(seq, global_descs, local_feats, dataset, match_results_save_path=None):
+def evaluateResults(seq, global_descs, local_feats, dataset, match_results_save_path=None, top_k=10):
 
-    if match_results_save_path is not None: 
+    if match_results_save_path is not None:
         os.system('mkdir -p ' + match_results_save_path)
         all_errs = []
-        local_feats = local_feats.transpose(0,2,3,1)
 
     gt_thres = 5  # gt threshold
-    faiss_index = faiss.IndexFlatL2(global_descs.shape[1]) 
+    faiss_index = faiss.IndexFlatL2(global_descs.shape[1])
     faiss_index.add(global_descs[:dataset.db_split_index])
 
-    _, predictions = faiss_index.search(global_descs[dataset.db_split_index+int(200/dataset.sample_inteval):], 1)  #top1
-    
-    
+    _, predictions = faiss_index.search(global_descs[dataset.db_split_index+int(200/dataset.sample_inteval):], top_k)
+
     eval_start_split_point = dataset.db_split_index+int(200/dataset.sample_inteval)
     all_positives = 0
     tp = 0
-    for q_idx, pred in enumerate(predictions):
+
+    local_feats_hw_last = None
+    if local_feats is not None:
+        local_feats_hw_last = local_feats.transpose(0, 2, 3, 1)
+
+    def geometric_verify(query_idx, cand_idx, return_visual=False):
+        if local_feats_hw_last is None:
+            return 0, None
+
+        query_im = (dataset[query_idx][0].transpose(1, 2, 0) * 256).astype(np.uint8)
+        db_im = (dataset[cand_idx][0].transpose(1, 2, 0) * 256).astype(np.uint8)
+
+        fast = cv2.FastFeatureDetector_create()
+        query_kps = fast.detect(query_im, None)
+        db_kps = fast.detect(db_im, None)
+
+        if len(query_kps) < 2 or len(db_kps) < 2:
+            return 0, None
+
+        def _gather_descriptors(kps, feat_map):
+            h, w = feat_map.shape[:2]
+            desc = []
+            valid_kps = []
+            for kp in kps:
+                x, y = int(kp.pt[0]), int(kp.pt[1])
+                if 0 <= x < w and 0 <= y < h:
+                    desc.append(feat_map[y, x])
+                    valid_kps.append(kp)
+            return np.array(desc, dtype=np.float32), valid_kps
+
+        query_des, query_kps = _gather_descriptors(query_kps, local_feats_hw_last[query_idx])
+        db_des, db_kps = _gather_descriptors(db_kps, local_feats_hw_last[cand_idx])
+
+        if len(query_des) < 2 or len(db_des) < 2:
+            return 0, None
+
+        matcher = cv2.BFMatcher()
+        matches = matcher.knnMatch(query_des, db_des, k=2)
+        all_match = [m[0] for m in matches if len(m) > 0]
+
+        if len(all_match) < 2:
+            return 0, None
+
+        points1 = np.float32([query_kps[m.queryIdx].pt for m in all_match])
+        points2 = np.float32([db_kps[m.trainIdx].pt for m in all_match])
+
+        im_side = db_im.shape[0]
+        H, mask, max_csc_num = rigidRansac((np.array([[im_side//2, im_side//2]]-points1)*0.4), (np.array([[im_side//2, im_side//2]]-points2))*0.4)
+
+        if max_csc_num <= 0:
+            return 0, None
+
+        result = {"score": int(max_csc_num), "mask": mask, "query_kps": query_kps, "db_kps": db_kps,
+                  "all_match": all_match, "H": H, "query_im": query_im, "db_im": db_im}
+
+        if return_visual:
+            q_pose = dataset.poses[query_idx]
+            q_pose = np.hstack((q_pose[:12].reshape(3, 4)[:2, :2], q_pose[:12].reshape(3, 4)[:2, 3].reshape(-1, 1)))
+            q_pose = np.vstack((q_pose, np.array([[0, 0, 1]])))
+
+            db_pose = dataset.poses[cand_idx]
+            db_pose = np.hstack((db_pose[:12].reshape(3, 4)[:2, :2], db_pose[:12].reshape(3, 4)[:2, 3].reshape(-1, 1)))
+            db_pose = np.vstack((db_pose, np.array([[0, 0, 1]])))
+
+            relative_gt = np.linalg.inv(db_pose).dot((q_pose))
+            relative_H = np.vstack((H, np.array([[0, 0, 1]])))
+
+            err = np.linalg.inv(relative_H).dot(relative_gt)
+            err_theta = np.abs(np.arctan2(err[0, 1], err[0, 0]) / np.pi * 180)
+            err_trans = np.sqrt(err[0, 2]**2 + err[1, 2]**2)
+
+            result.update({"err_trans": err_trans, "err_theta": err_theta, "relative_H": relative_H})
+
+        return result["score"], result
+
+    for q_idx, cand_preds in enumerate(predictions):
 
         query_idx = eval_start_split_point+q_idx
         gt_dis = (dataset.poses[query_idx] - dataset.poses[:dataset.db_split_index])**2
         positives = np.where(np.sum(gt_dis[:,[3,7,11]],axis=1) < gt_thres**2 )[0]
         if len(positives)>0:
             all_positives+=1
-            if pred[0] in positives:
+
+            best_pred = cand_preds[0]
+            best_geo = None
+
+            if local_feats_hw_last is not None:
+                best_score = -1
+                for cand_idx in cand_preds:
+                    score, geo_result = geometric_verify(query_idx, cand_idx, return_visual=match_results_save_path is not None)
+                    if score > best_score:
+                        best_score = score
+                        best_pred = cand_idx
+                        best_geo = geo_result
+
+            if best_pred in positives:
                 tp += 1
 
-            if match_results_save_path is not None:
+            if match_results_save_path is not None and best_geo is not None:
 
-                index = pred[0]
-
-
-                query_im = dataset[query_idx][0].transpose(1,2,0)*256
-                db_im = dataset[index][0].transpose(1,2,0)*256
-
-                query_im = query_im.astype(np.uint8)
-                db_im = db_im.astype(np.uint8)
-
-                fast = cv2.FastFeatureDetector_create()
-                im_side = db_im.shape[0]
-
-                query_kps = fast.detect(query_im, None)
-                db_kps = fast.detect(db_im, None)
-
-                
-                query_des = [local_feats[query_idx][int(kp.pt[1]),int(kp.pt[0])] for kp in query_kps]
-                db_des = [local_feats[index][int(kp.pt[1]),int(kp.pt[0])] for kp in db_kps]
-                
-                query_des = np.array(query_des)
-                db_des = np.array(db_des)
-                
-                matcher = cv2.BFMatcher()
-                matches = matcher.knnMatch(query_des, db_des, k=2)
-                
-                
-
-                all_match = [m[0] for m in matches]
-                points1 = np.float32([query_kps[m.queryIdx].pt for m in all_match]) 
-                points2 = np.float32([db_kps[m.trainIdx].pt for m in all_match])
-
-                H, mask, max_csc_num = rigidRansac((np.array([[im_side//2,im_side//2]]-points1)*0.4),(np.array([[im_side//2,im_side//2]]-points2))*0.4)# cv2.findHomography(points1, points2, cv2.RANSAC, 4.0)
-                
-                q_pose = dataset.poses[query_idx]
-
-                q_pose = np.hstack((q_pose[:12].reshape(3,4)[:2,:2], q_pose[:12].reshape(3,4)[:2,3].reshape(-1,1)))
-                q_pose = np.vstack((q_pose,np.array([[0,0,1]])))
-
-                db_pose = dataset.poses[index]
-                db_pose = np.hstack((db_pose[:12].reshape(3,4)[:2,:2], db_pose[:12].reshape(3,4)[:2,3].reshape(-1,1)))
-                db_pose = np.vstack((db_pose,np.array([[0,0,1]])))
-
-                relative_gt = np.linalg.inv(db_pose).dot((q_pose))
-                relative_H = np.vstack((H, np.array([[0,0,1]])))
-                
-                err = np.linalg.inv(relative_H).dot(relative_gt)
-                err_theta = np.abs(np.arctan2(err[0,1], err[0,0])/np.pi*180)
-                err_trans = np.sqrt(err[0,2]**2+err[1,2]**2)
-
-                if err_theta>5 or err_trans>2:
-                    print('bug')
-                all_errs.append([err_trans, err_theta])
-                              
-                good_match = [all_match[i] for i in range(len(mask)) if  mask[i]]
+                query_im = best_geo["query_im"]
+                db_im = best_geo["db_im"]
+                mask = best_geo["mask"]
+                good_match = [best_geo["all_match"][i] for i in range(len(mask)) if mask[i]]
                 db_im = db_im*3
                 db_im[:,:,:2]=0
 
 
-                im = cv2.drawMatches(query_im.astype(np.uint8), query_kps, db_im.astype(np.uint8), db_kps, good_match, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-                
+                im = cv2.drawMatches(query_im.astype(np.uint8), best_geo["query_kps"], db_im.astype(np.uint8), best_geo["db_kps"], good_match, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
                 out_im = np.zeros((im.shape[0]*2, db_im.shape[1]*3,3))
                 out_im[:im.shape[0], :db_im.shape[1]] = query_im
                 out_im[:im.shape[0], db_im.shape[1]:db_im.shape[1]*2] = db_im
                 out_im[:im.shape[0], db_im.shape[1]*2:] = db_im+query_im
 
                 out_im[-im.shape[0]:, :db_im.shape[1]*2] = im
-                
 
-                H = relative_H 
+
+                H = best_geo["relative_H"]
                 mat = cv2.getRotationMatrix2D((query_im.shape[0]//2, query_im.shape[0]//2), np.arctan2(-H[0,1], H[0,0])/np.pi*180, 1.0)
                 mat[0,2] -= H[1,2]/0.4
                 mat[1,2] -= H[0,2]/0.4
@@ -150,22 +186,25 @@ def evaluateResults(seq, global_descs, local_feats, dataset, match_results_save_
                 im_warp = cv2.warpAffine(db_im, mat, query_im.shape[:2])
 
                 im_warp[:,:,:2]=0
-                out_im[-im.shape[0]:, db_im.shape[1]*2:db_im.shape[1]*3] = im_warp+query_im                
+                out_im[-im.shape[0]:, db_im.shape[1]*2:db_im.shape[1]*3] = im_warp+query_im
                 cv2.imwrite(match_results_save_path+str(1000000+query_idx)[1:]+".png", out_im)
 
-    
-      
+                all_errs.append([best_geo["err_trans"], best_geo["err_theta"]])
+
+
     recall_top1 = tp / all_positives #tp/(tp+fp)
 
-    
 
-    if match_results_save_path is not None:
+
+    if match_results_save_path is not None and len(all_errs)>0:
         all_errs = np.array(all_errs)
         success_loc = (all_errs[:,0]<2) & (all_errs[:,1]<5)
         success_rate = np.sum(success_loc)/all_positives
         mean_trans_err = np.mean(all_errs[success_loc,1])
-        mean_rot_err = np.mean(all_errs[success_loc,0]) 
+        mean_rot_err = np.mean(all_errs[success_loc,0])
         return recall_top1, success_rate, mean_trans_err, mean_rot_err
+    elif match_results_save_path is not None:
+        return recall_top1, 0, 0, 0
     else:
         return recall_top1
 
